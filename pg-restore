@@ -1,0 +1,136 @@
+#!/bin/bash
+# A simple script to restore a backed up postgresql database. Companion to pg-backup.
+# Define the backup source
+# Define the backup target (where to store the backups)
+source_user="backup"
+source_host="bigfoot"
+source_dir="/media/backups/postgres"
+
+# Configure restore target
+target_user="postgres"
+
+# PostgreSQL knows which base backup a given WAL files apply to a given base
+base_subdir="base"
+wals_subdir="wals"
+
+# Derived directories
+# Path to your PostgreSQL binary directory and data (base and incremental)
+pg_data_dir=$(psql -U $target_user -h $target_host -tAc "SHOW data_directory;")
+pg_wals_dir="$pg_data_dir/pg_wal"
+
+# Path to recovery.conf file
+recovery_conf="$pg_data_dir/recovery.conf"
+
+show_help_and_exit () {
+	echo "Usage: pg-backup [-dvnh]"
+	echo
+	echo "where:"
+  echo "where:"
+	echo "	-d	requests a dry run that echoes all commands that would be run (but aren't)"
+  echo "	-v	Show verbose output (for diagnostics)"
+  echo "	-n	Non-destructive (will rename not remove the existing PostgreSQL data directory)"
+	echo "	-h	Show help"
+	echo
+	exit
+}
+
+dry_run=false
+verbose=false
+safemode=false
+while getopts "dvh" flag; do
+	case "$flag" in
+		d) dry_run=true ;;
+    n) safemode=true ;;
+    v) verbose=true ;;
+		h) show_help_and_exit;;
+	esac
+done
+
+if [ $verbose = true ]; then
+    echo "Configuration:"
+    echo "  Base backups at: $source_host@$source_host:$source_dir/$base_subdir"
+    echo "  Incremental backups at: $source_host@$source_host:$source_dir/$base_subdir"
+    echo "  PostgreSQL Data directory: $pg_data_dir"
+    echo "  PostgreSQL WALs directory: $pg_wals_dir"
+    echo
+fi
+
+if [ $dry_run = true ]; then
+    prefix="echo -e \t"
+  	echo "Dry run (commands that would be executed are):"
+    echo
+else
+  	prefix=""
+fi
+
+check_prerequisites () {
+  declare -A requisites
+  # A name as key and commmand to test it with as value
+  components=(
+    ["PostgreSQL"]="psql"
+    ["rsync"]="rsync"
+  )
+
+  missing=()
+  for name in "${!requisites[@]}"; do
+      if ! command -v "${requisites[$name]}" &> /dev/null; then
+          missing+=("$name")/tmp/postgres/archive
+      fi
+  done
+
+  # If any component is missing, prompt the user to install
+  if [ ${#missing[@]} -ne 0 ]; then
+      echo "pg-restore:"
+      echo
+      echo "The following requisites are missing: ${missing[*]}"
+      echo "pg-restore can't run without them."
+      exit 1
+  fi
+
+  # Find the installed version of postgreSQL (using the pg_basebackup utility
+  # which is in a stanrd bin directory and which we need anyhow to take the backup)
+  postgres_version=$(pg_basebackup --version | awk '{print $NF}' | cut -d'.' -f1)
+
+  if [ "$postgres_version" -lt 12 ]; then
+      echo "PostgreSQL version is less than 12. Only 12 and up are supported."
+      exit 1
+  elif [ $verbose = true ]; then
+    echo "  PostgreSQL version: $postgres_version"
+  fi
+}
+
+trigger_recovery_mode() {
+    #  Pre PG12 recover worked differently. We don't support it here.
+    # No PG11 or earlier servers in use here.
+    recovery_conf="$pg_data_dir/recovery.conf"
+    recovery_signal="$pg_data_dir/recovery.signal"
+    if [ -f "$recovery_conf" ]; then
+        echo "Error: recovery.conf exists. PostgreSQL 12 and above do not support recovery.conf"
+        exit 1
+    fi
+
+    # Create recovery.signal file to trigger recovery mode
+    sudo touch "$recovery_signal"
+}
+
+# Stop PostgreSQL
+${prefix}sudo service postgresql stop
+
+# Remove the existing base
+if [ $safemode = true ]; then
+  timestamp=$(date +'%Y-%m-%d-%H:%M:%S')
+  ${prefix}sudo mv "$pg_data_dir" "$pg_data_dir.$timestamp"
+else
+  ${prefix}sudo rm -rf "$pg_data_dir"
+fi
+
+# Restore the base backup
+${prefix}sudo rsync -av "$source_user@$source_host:$source_dir/$base_subdir" "$pg_data_dir"
+
+# Restore the WALs
+${prefix}sudo rsync -av "$source_user@$source_host:$source_dir/$wals_subdir" "$pg_data_dir/pg_wal"
+
+trigger_recovery_mode
+
+# Start the PostgreSQL service
+${prefix}sudo service postgresql start

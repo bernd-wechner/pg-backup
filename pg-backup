@@ -1,0 +1,239 @@
+#!/bin/bash
+# A script to run nightly to backup postgres reliably
+#
+# To use this ensure that in postgres.conf
+#
+# wal_level = replica
+#
+# Which is needed to ensure write ahead logs are available for incremental backup.
+#
+# Aslos relies upon postgresql, rsync and sshfs, so if sshfs isn't installed:
+#
+#   sudo apt instal sshfs
+
+# Configurable variable for base backup frequency in days
+rebase_days=7
+
+# Configure backup source
+source_user="postgres"
+
+# Define a temporary directory (ideally a tmpfs, a RAM disk) to hold the backup archive.
+# Of course if it's large then a tmpfs may be  abad choice here and best to opt for
+# a drive on the source host that will have space. This willd epend on the databse size
+# of course and the resources on the host.
+#
+# To find out how much space is availabe "df -H"
+# To find the size of know base backup "du -h"
+#
+# This directory should not exist, will be created and removed during the backup.
+local_archive_mount="/tmp/postgres/archive"
+
+# Define the backup target (where to store the backups)
+# sshfs will be used to mount this locally at local_archive_mount
+target_user="backup"
+target_host="bigfoot"
+target_dir="/media/Data/Backups/postgres"
+
+# PostgreSQL knows which base backup a given WAL files apply to a given base
+base_subdir="base"
+wals_subdir="wals"
+
+# Path to your PostgreSQL binary directory and data (base and incremental)
+pg_data_dir=$(psql -U $source_user -h localhost -tAc "SHOW data_directory;")
+pg_wals_dir="$pg_data_dir/pg_wal"
+
+show_help_and_exit () {
+	echo "Usage: pg-backup [-dvh]"
+	echo
+	echo "where:"
+	echo "	-d	requests a dry run that echoes all commands that would be run (but aren't)"
+  echo "	-v	Show verbose output (for diagnostics)"
+	echo "	-h	Show help"
+	echo
+	exit
+}
+
+dry_run=false
+verbose=false
+while getopts "dvh" flag; do
+	case "$flag" in
+		d) dry_run=true ;;
+    v) verbose=true ;;
+		h) show_help_and_exit;;
+	esac
+done
+
+if [ $verbose = true ]; then
+    echo "Configuration:"
+    echo "  Base backups at: $local_archive_mount/$base_subdir aka $target_user@$target_host:$target_dir/$base_subdir"
+    echo "  Incremental backups at: $local_archive_mount/$base_subdir aka $target_user@$target_host:$target_dir/$wals_subdir"
+    echo "  PostgreSQL Data directory: $pg_data_dir"
+    echo "  PostgreSQL WALs directory: $pg_wals_dir"
+    echo
+fi
+
+if [ $dry_run = true ]; then
+    prefix="echo -e \t"
+  	echo "Dry run (commands that would be executed are):"
+    echo
+else
+  	prefix=""
+fi
+
+check_prerequisites () {
+  declare -A requisites
+  # A name as key and commmand to test it with as value
+  components=(
+    ["PostgreSQL"]="psql"
+    ["sshfs"]="sshfs"
+    ["rsync"]="rsync"
+  )
+
+  missing=()
+  for name in "${!requisites[@]}"; do
+      if ! command -v "${requisites[$name]}" &> /dev/null; then
+          missing+=("$name")/tmp/postgres/archive
+      fi
+  done
+
+  # If any component is missing, prompt the user to install
+  if [ ${#missing[@]} -ne 0 ]; then
+      echo "pg-backup:"
+      echo
+      echo "The following requisites are missing: ${missing[*]}"
+      echo "pg-backup can't run without them."
+      exit 1
+  fi
+
+  # Find the installed version of postgreSQL (using the pg_basebackup utility
+  # which is in a stanrd bin directory and which we need anyhow to take the backup)
+  postgres_version=$(pg_basebackup --version | awk '{print $NF}' | cut -d'.' -f1)
+  pg_bin_dir="/usr/lib/postgresql/${postgres_version}/bin"
+
+  if [ $verbose = true ]; then
+    echo "  PostgreSQL version: $postgres_version"
+    echo "  PostgreSQL bin: $pg_bin_dir"
+  fi
+
+  # Test if pg_controldata exists for the specific version
+  if ! [ -x "$pg_bin_dir/pg_controldata" ]; then
+      echo "pg_controldata not found for PostgreSQL version: $postgres_version"
+  fi
+
+  # Test if pg_archivecleanup exists for the specific version
+  if ! [ -x "$pg_bin_dir/pg_archivecleanup" ]; then
+      echo "pg_archivecleanup not found for PostgreSQL version: $postgres_version"
+  fi
+
+  # If local_archive_mount exists, then if it's a mountpoint try and unmount
+  # and ensure it's empty either way.
+  if [ -d "$local_archive_mount" ]; then
+    bail=false
+    if mountpoint -q "$local_archive_mount"; then
+        if ! sudo umount "$local_archive_mount"; then
+           bail=true
+        fi
+        if [ $verbose = true ]; then
+          echo "Found existing mount at $local_archive_mount and released (unmounted) it."
+        fi
+    fi
+
+    if ! [ -z "$(ls -A "$local_archive_mount")" ]; then
+        bail=true
+    fi
+
+    if [ $bail = true ]; then
+        echo "pg-backup:"
+        echo
+        echo "Configured to use a local mount at $local_archive_mount."
+        echo "This must be a non-existing directory or empty directory, pg-backup creates it, mounts the remote backup host there, and then removes it."
+        exit 1
+    fi
+  fi
+}
+
+# -a is shorthand for rlptgoD
+# -r is recursive
+# -l copies symlinks as symlinks
+# -L transforms symlinks to their files/directories (copies content)
+# -p preserves permissions
+# -t preserves modification times
+# -g preserves group
+# -o preserves owner
+# -D preserves device and special files
+# -v verbose
+ropts="-a"
+
+backup_base() {
+  echo "Backing up database (base backup)... "
+
+  # pg_basebackup can't target a remote machine so we aim for a local sshfs mount
+  # of the backup host dir.
+  #
+  # -h specifies the database host
+  # -U specifies the database user
+  # -D specifies the target directory to write to
+  # -P reports progressalias ="#statement"
+  ${prefix}pg_basebackup -h localhost -U $source_user -D "$local_archive_mount/$base_subdir" -P
+}
+
+backup_wals() {
+    echo "Backing up WALs (incremental backups)... "
+    if [ $verbose = true ]; then
+      echo Replicating "$pg_wals_dir" to "$target_user@$target_host:$target_dir/$wals_subdir"
+    fi
+    # rsycn does not play nice with sshfs mounted directories.
+    # See: https://stackoverflow.com/a/54044303/4002633
+    # So we use rsync to  deliver directly to the target
+    # host not via the sshfs mount.
+    ${prefix}sudo rsync $ropts "$pg_wals_dir/" "$target_user@$target_host:$target_dir/$wals_subdir"
+
+}
+
+purge_wals() {
+    echo "Purging any unneeded WALs... "
+    redo_wal=$($pg_bin_dir/pg_controldata "$local_archive_mount/$base_subdir" | grep "REDO WAL file" | awk -F: '{print $2}' | xargs)
+    if [ $verbose = true ]; then
+      echo "Purging WALs prior to $redo_wal"
+    fi
+    ${prefix}$pg_bin_dir/pg_archivecleanup "$local_archive_mount/$wals_subdir" "$redo_wal"
+}
+
+# Check prerequistes first
+check_prerequisites
+
+# Mount the archive location locally. Various postgres utilities aren't well tailored
+# for working with a remote backup location. The easiest way to esnure it all works well
+# is with an sshfs.
+mkdir -p "$local_archive_mount"
+if [ $verbose = true ]; then
+  echo Mounting "$target_user@$target_host:$target_dir" on "$local_archive_mount"
+fi
+sshfs "$target_user@$target_host:$target_dir" "$local_archive_mount"
+
+if ! [ -d "$local_archive_mount/$base_subdir" ]; then
+    echo "No existing base backup."
+    backup_base
+else
+    last_base_time=$($pg_bin_dir/pg_controldata "$local_archive_mount/$base_subdir" | awk -F: '/Time of latest checkpoint:/ {print $2}' | xargs)
+    last_base_time_s=$(date -d "$last_base_time" '+%s')
+    current_time_s=$(date '+%s')
+    base_age_days=$(( (current_time_s - last_base_time_s) / (60 * 60 * 24) ))
+
+    if [ $verbose = true ]; then
+        echo "  Last base backed up: $last_base_time"
+        echo "  Last base age (days): $base_age_days"
+    fi
+
+    if [ "$base_age_days" -gt "$rebase_days" ]; then
+        backup_base
+    fi
+fi
+
+backup_wals
+purge_wals
+
+if [ $verbose = true ]; then
+  echo Releasing mount on "$local_archive_mount"
+fi
+umount "$local_archive_mount"
