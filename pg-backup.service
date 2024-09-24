@@ -1,0 +1,9 @@
+[Unit]
+Description=PostgreSQL backup
+
+[Service]
+User=root
+Type=oneshot
+
+# Substitute in full path of pg-backup here
+ExecStart=pg-backup-path -vnf

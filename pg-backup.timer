@@ -1,0 +1,11 @@
+[Unit]
+Description=PostgreSQL backup timer
+Requires=pg-backup.service
+
+[Timer]
+# 3 am every day
+OnCalendar=*-*-* 3:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,10 +1,13 @@
 #!/bin/bash
 # A simple script to restore a backed up postgresql database. Companion to pg-backup.
+
+# get the hostname
+hostname=$(hostname)
+
 # Define the backup source
-# Define the backup target (where to store the backups)
 source_user="backup"
 source_host="bigfoot"
-source_dir="/media/backups/postgres"
+source_dir="/media/Backups/postgres/$hostname"
 
 # Configure restore target
 target_user="postgres"
@@ -25,10 +28,10 @@ show_help_and_exit () {
 	echo "Usage: pg-backup [-dvnh]"
 	echo
 	echo "where:"
-  echo "where:"
+    echo "where:"
 	echo "	-d	requests a dry run that echoes all commands that would be run (but aren't)"
-  echo "	-v	Show verbose output (for diagnostics)"
-  echo "	-n	Non-destructive (will rename not remove the existing PostgreSQL data directory)"
+    echo "	-v	Show verbose output (for diagnostics)"
+    echo "	-n	Non-destructive (will rename not remove the existing PostgreSQL data directory)"
 	echo "	-h	Show help"
 	echo
 	exit

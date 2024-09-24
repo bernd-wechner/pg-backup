@@ -3,16 +3,25 @@
 #
 # To use this ensure that in postgres.conf
 #
-# wal_level = replica
+# 	wal_level = replica
 #
 # Which is needed to ensure write ahead logs are available for incremental backup.
 #
-# Aslos relies upon postgresql, rsync and sshfs, so if sshfs isn't installed:
+# Also relies upon postgresql, rsync and sshfs, so if sshfs isn't installed:
 #
 #   sudo apt instal sshfs
 
+# If debugging output script path and line number
+export PS4='+${BASH_SOURCE}:${LINENO}: '
+
+# Configure the date time format for the -l option
+date_format="+%a %b %e %T %Y"
+
 # Configurable variable for base backup frequency in days
 rebase_days=7
+
+# get the hostname
+hostname=$(hostname)
 
 # Configure backup source
 source_user="postgres"
@@ -26,130 +35,198 @@ source_user="postgres"
 # To find the size of know base backup "du -h"
 #
 # This directory should not exist, will be created and removed during the backup.
+# and emptied if -f is provided. Make sure it's a safe spot.
 local_archive_mount="/tmp/postgres/archive"
 
 # Define the backup target (where to store the backups)
 # sshfs will be used to mount this locally at local_archive_mount
 target_user="backup"
 target_host="bigfoot"
-target_dir="/media/Data/Backups/postgres"
+target_dir="/media/Backups/postgres/$hostname"
 
 # PostgreSQL knows which base backup a given WAL files apply to a given base
-base_subdir="base"
-wals_subdir="wals"
+base_subdir="base"  # Base backups
+wals_subdir="wals"  # Incremental backups
+arch_subdir="arch"  # base backup archives
+
+# locate some log files
+run_time_log_days=30
+run_time_log="$local_archive_mount/backup_run_time.log"
+wal_time_log="$local_archive_mount/wal_birth_time.log"
+sql_target="$local_archive_mount/databases.sql"
 
 # Path to your PostgreSQL binary directory and data (base and incremental)
 pg_data_dir=$(psql -U $source_user -h localhost -tAc "SHOW data_directory;")
 pg_wals_dir="$pg_data_dir/pg_wal"
 
 show_help_and_exit () {
-	echo "Usage: pg-backup [-dvh]"
-	echo
-	echo "where:"
-	echo "	-d	requests a dry run that echoes all commands that would be run (but aren't)"
-  echo "	-v	Show verbose output (for diagnostics)"
-	echo "	-h	Show help"
-	echo
-	exit
+    echo "Usage: pg-backup [-dvbsSnflmxDh]"
+    echo
+    echo "where:"
+    echo "    -d    requests a dry run that echoes all commands that would be run (but aren't)"
+    echo "    -v    Show verbose output (for diagnostics)"
+    echo "    -b    Force a base backup (whole database not incremental)"
+    echo "    -s    Dump all databases to SQL (along with base - i.e. only when the base is backed up)"
+    echo "    -S    Dump all databases to SQL (regardless - i.e on this backup run)"
+    echo "    -n    Non-destructive (will archive old base backups rather than removing them when a new one is needed)"
+    echo "    -f    Force a clean up of the local archive mountpoint if necessary"
+    echo "    -l    list backups"
+    echo "    -m    mount backups"
+    echo "    -x    Trace this script (for debugging)"
+    echo "    -D    Write some debugging info"
+    echo "    -h    Show help"
+    echo
+    exit
 }
 
 dry_run=false
 verbose=false
-while getopts "dvh" flag; do
-	case "$flag" in
-		d) dry_run=true ;;
-    v) verbose=true ;;
-		h) show_help_and_exit;;
-	esac
+safemode=false
+force=false
+list=false
+mount=false
+base=false
+dump_sql=false
+dump_SQL=false
+debug=false
+while getopts "dvbsSnflmxDh" flag; do
+    case "$flag" in
+        d) dry_run=true ;;
+        v) verbose=true ;;
+        b) base=true ;;
+        s) dump_sql=true ;;
+        S) dump_SQL=true ;;
+        n) safemode=true ;;
+        f) force=true ;;
+        l) list=true ;;
+        m) mount=true ;;
+        x) set -x ;;
+        D) debug=true  ;;
+        h) show_help_and_exit;;
+    esac
 done
 
 if [ $verbose = true ]; then
     echo "Configuration:"
-    echo "  Base backups at: $local_archive_mount/$base_subdir aka $target_user@$target_host:$target_dir/$base_subdir"
-    echo "  Incremental backups at: $local_archive_mount/$base_subdir aka $target_user@$target_host:$target_dir/$wals_subdir"
-    echo "  PostgreSQL Data directory: $pg_data_dir"
-    echo "  PostgreSQL WALs directory: $pg_wals_dir"
+    echo -e "\tRunning as: $(whoami)"
+    echo -e "\tBase backups at: $local_archive_mount/$base_subdir aka $target_user@$target_host:$target_dir/$base_subdir"
+    echo -e "\tIncremental backups at: $local_archive_mount/$base_subdir aka $target_user@$target_host:$target_dir/$wals_subdir"
+    echo -e "\tBase backup archives at: $local_archive_mount/$arch_subdir aka $target_user@$target_host:$target_dir/$arch_subdir"
+    echo -e "\tPostgreSQL Data directory: $pg_data_dir"
+    echo -e "\tPostgreSQL WALs directory: $pg_wals_dir"
     echo
 fi
 
 if [ $dry_run = true ]; then
     prefix="echo -e \t"
-  	echo "Dry run (commands that would be executed are):"
+    echo "Dry run (commands that would be executed are):"
     echo
 else
-  	prefix=""
+    prefix=""
 fi
 
 check_prerequisites () {
-  declare -A requisites
-  # A name as key and commmand to test it with as value
-  components=(
-    ["PostgreSQL"]="psql"
-    ["sshfs"]="sshfs"
-    ["rsync"]="rsync"
-  )
+	declare -A requisites
+	# A name as key and commmand to test it with as value
+	components=(
+	    ["PostgreSQL"]="psql"
+	    ["sshfs"]="sshfs"
+	    ["rsync"]="rsync"
+	)
+	
+	missing=()
+	for name in "${!requisites[@]}"; do
+	    if ! command -v "${requisites[$name]}" &> /dev/null; then
+	        missing+=("$name")/tmp/postgres/archive
+	    fi
+	done
+	
+	# If any component is missing, prompt the user to install
+	if [ ${#missing[@]} -ne 0 ]; then
+	    echo "pg-backup:"
+	    echo
+	    echo "The following requisites are missing: ${missing[*]}"
+	    echo "pg-backup can't run without them."
+	    exit 1
+	fi
+	
+	# Find the installed version of postgreSQL (using the pg_basebackup utility
+	# which is in a standard bin directory and which we need anyhow to take the backup)
+	postgres_version=$(pg_basebackup --version | awk '{print $NF}' | cut -d'.' -f1)
+	pg_bin_dir="/usr/lib/postgresql/${postgres_version}/bin"
+	
+	if [ $verbose = true ]; then
+	    echo "PostgreSQL configuration:"
+	    echo -e "\tversion: $postgres_version"
+	    echo -e "\tbin: $pg_bin_dir"
+	    echo
+	fi
+	
+	# Test if pg_controldata exists for the specific version
+	if ! [ -x "$pg_bin_dir/pg_controldata" ]; then
+	    echo "pg_controldata not found for PostgreSQL version: $postgres_version"
+	fi
+	
+	# Test if pg_archivecleanup exists for the specific version
+	if ! [ -x "$pg_bin_dir/pg_archivecleanup" ]; then
+	    echo "pg_archivecleanup not found for PostgreSQL version: $postgres_version"
+	fi
 
-  missing=()
-  for name in "${!requisites[@]}"; do
-      if ! command -v "${requisites[$name]}" &> /dev/null; then
-          missing+=("$name")/tmp/postgres/archive
-      fi
-  done
+	# Test if pg_dumpall exists for the specific version
+	if ! [ -x "$pg_bin_dir/pg_dumpall" ]; then
+	    echo "pg_dumpall not found for PostgreSQL version: $postgres_version"
+	fi
 
-  # If any component is missing, prompt the user to install
-  if [ ${#missing[@]} -ne 0 ]; then
-      echo "pg-backup:"
-      echo
-      echo "The following requisites are missing: ${missing[*]}"
-      echo "pg-backup can't run without them."
-      exit 1
-  fi
-
-  # Find the installed version of postgreSQL (using the pg_basebackup utility
-  # which is in a stanrd bin directory and which we need anyhow to take the backup)
-  postgres_version=$(pg_basebackup --version | awk '{print $NF}' | cut -d'.' -f1)
-  pg_bin_dir="/usr/lib/postgresql/${postgres_version}/bin"
-
-  if [ $verbose = true ]; then
-    echo "  PostgreSQL version: $postgres_version"
-    echo "  PostgreSQL bin: $pg_bin_dir"
-  fi
-
-  # Test if pg_controldata exists for the specific version
-  if ! [ -x "$pg_bin_dir/pg_controldata" ]; then
-      echo "pg_controldata not found for PostgreSQL version: $postgres_version"
-  fi
-
-  # Test if pg_archivecleanup exists for the specific version
-  if ! [ -x "$pg_bin_dir/pg_archivecleanup" ]; then
-      echo "pg_archivecleanup not found for PostgreSQL version: $postgres_version"
-  fi
-
-  # If local_archive_mount exists, then if it's a mountpoint try and unmount
-  # and ensure it's empty either way.
-  if [ -d "$local_archive_mount" ]; then
-    bail=false
-    if mountpoint -q "$local_archive_mount"; then
-        if ! sudo umount "$local_archive_mount"; then
-           bail=true
-        fi
-        if [ $verbose = true ]; then
-          echo "Found existing mount at $local_archive_mount and released (unmounted) it."
-        fi
-    fi
-
-    if ! [ -z "$(ls -A "$local_archive_mount")" ]; then
-        bail=true
-    fi
-
-    if [ $bail = true ]; then
-        echo "pg-backup:"
-        echo
-        echo "Configured to use a local mount at $local_archive_mount."
-        echo "This must be a non-existing directory or empty directory, pg-backup creates it, mounts the remote backup host there, and then removes it."
-        exit 1
-    fi
-  fi
+	if [ $verbose = true ]; then
+	    echo "Using these utilities:"
+	    echo -e "\t$pg_bin_dir/pg_controldata"
+	    echo -e "\t$pg_bin_dir/pg_archivecleanup"
+	    echo -e "\t$pg_bin_dir/pg_dumpall"
+	    echo
+	fi
+	
+	# If local_archive_mount exists, then if it's a mountpoint try and unmount
+	# and ensure it's empty either way. There is a bizarre situation that can arise
+	# in which it is a mountpoint but the endpoint is not connected. This is hard 
+	# to detect as mountpoint (frustratingly) says it's not a  mountpoint when it is.
+	# So we need to check /proc/mounts alas.
+	is_mounted() { cut -d' ' -f2 /proc/mounts | grep -q "^$1$"; }
+	
+	bail=false
+	if is_mounted "$local_archive_mount"; then
+	    if ! sudo umount "$local_archive_mount"; then
+	       bail=true
+	       if [ $verbose = true ]; then
+	          echo "Found existing mount at $local_archive_mount but failed to unmount it!"
+	       fi 
+	    elif [ $verbose = true ]; then
+	         echo "Found existing mount at $local_archive_mount and released (unmounted) it."
+	    fi
+	fi
+	
+	if [ -d "$local_archive_mount" ]; then
+	  if ! [ -z "$(ls -A "$local_archive_mount")" ]; then
+	      if [ $force = true ]; then
+	          sudo rm -rf "$local_archive_mount"
+	          if [ $verbose = true ]; then
+	            echo "Cleaned it up."
+	          fi
+	      else
+	          bail=true
+	      fi
+	  fi
+	else
+	    echo "Mount at $local_archive_mount seems not to exist"
+	    bail=true
+	fi
+	
+	if [ $bail = true ]; then
+	   echo "pg-backup:"
+	   echo
+	   echo "Configured to use a local mount at $local_archive_mount."
+	   echo "This must be a non-existing directory or empty directory, pg-backup creates it, mounts the remote backup host there, and then removes it."
+	   exit 1
+	fi
 }
 
 # -a is shorthand for rlptgoD
@@ -165,16 +242,43 @@ check_prerequisites () {
 ropts="-a"
 
 backup_base() {
-  echo "Backing up database (base backup)... "
+    echo "Backing up database (base backup)... "
 
-  # pg_basebackup can't target a remote machine so we aim for a local sshfs mount
-  # of the backup host dir.
-  #
-  # -h specifies the database host
-  # -U specifies the database user
-  # -D specifies the target directory to write to
-  # -P reports progressalias ="#statement"
-  ${prefix}pg_basebackup -h localhost -U $source_user -D "$local_archive_mount/$base_subdir" -P
+    # Clean up first
+    if [ -d "$local_archive_mount/$base_subdir" ]; then
+        if [ $safemode = true ]; then
+            timestamp=$(date +'%Y-%m-%d-%H:%M:%S')
+            target = "$local_archive_mount/$arch_subdir/base.$timestamp"
+            if [ $verbose = true ]; then
+                echo "Archiving old base backup to $target"
+            fi
+            ${prefix}sudo mv "$local_archive_mount/$base_subdir" "$target"
+        else
+            if [ $verbose = true ]; then
+                echo "Removing old base backup ..."
+            fi
+            ${prefix}sudo rm -rf "$local_archive_mount/$base_subdir"
+        fi
+    fi
+
+    # pg_basebackup can't target a remote machine so we aim for a local sshfs mount
+    # of the backup host dir.
+    #
+    # -h specifies the database host
+    # -U specifies the database user
+    # -D specifies the target directory to write to
+    # -P reports progressalias ="#statement"
+    echo "Creating new base backup ..."
+    current_time=$(date "$date_format" | sed 's/  / /')
+    label="pg-backup run @ $current_time"
+    ${prefix}pg_basebackup -h localhost -U $source_user -D "$local_archive_mount/$base_subdir" -l "$label"   
+}
+
+dump_sql() {
+	# Dumping all the SQL is rather slow and generates a large file, but is an added security if desired, 
+	# capturing all the data in the database in way that can be restored to another database.
+    echo "Dumping SQL ..."
+	${prefix}"$pg_bin_dir/pg_dumpall" -h localhost -U $source_user -w --quote-all-identifiers > "$sql_target"
 }
 
 backup_wals() {
@@ -182,12 +286,82 @@ backup_wals() {
     if [ $verbose = true ]; then
       echo Replicating "$pg_wals_dir" to "$target_user@$target_host:$target_dir/$wals_subdir"
     fi
-    # rsycn does not play nice with sshfs mounted directories.
+   
+    # rsync does not play nice with sshfs mounted directories.
     # See: https://stackoverflow.com/a/54044303/4002633
     # So we use rsync to  deliver directly to the target
-    # host not via the sshfs mount.
+    # host using ssh not via the sshfs mount.
     ${prefix}sudo rsync $ropts "$pg_wals_dir/" "$target_user@$target_host:$target_dir/$wals_subdir"
+    
+    # We want however also to write a log of the WAL file creation times in support of the -l option
+    # We get them from the horses mouth so to speak, from the source $pg_wals_dir and can write them
+    # to a file on the sshfs mount $local_archive_mount. We do this because its so hard to get birth
+    # times to begin with (needing the debugfs) and we can't trust rsync to preserve them (it's a big 
+    # ask as the target filesystem can of course record birth times as the times the copy was made and
+    # would like to report the actual date of the WAL (when postgres created it). To wit read them from
+    # horses mouth and log them.     
+	> "$wal_time_log"  # Clear the log file first
+	if sudo find "$pg_wals_dir" -maxdepth 1 -type f > /dev/null 2>&1; then
+	    sudo find "$pg_wals_dir" -maxdepth 1 -type f | while read -r file; do
+			bname=$(basename "$file")
+			
+			# We want to record a time against each WAL. Primarily so that we can get an estimate for -l as 
+			# to age of the last archived data. 
+			# 
+			# There's no way Postgres makes that easy.
+			# 	pg_basebackup is not god and won't tell us
+			#	pg_controldata won't tell us
+			#	pg_archivecleanup has a verbose and dry run mode but won't tell us
+			#   pg_waldump won't tell us, it oesn't eport timestamps on any of the records it shares.
+			#
+			# So we can fall back on timestamps on the WAL files. There is scope here to
+			# experiment with birth time, access time, modification time or change time.
+			# Birth seemed a good candidate but it seems filnames are recycled and bith 
+			# becomes misleading. Acccess is meaningless and unreliable. Leaving Modification
+			# (datafile content) and Change (datafile metadata), and Modification seems the 
+			# most confident estimate of the dat of relevance for a WAL. The lst time postgres 
+			# wrote to that file! 
+			#
+			# Birth is further complicated that it's not supported on older systems and so 
+			# and old workaround using debugfs is needed and implemented here.
+			#
+			# These are available for debugging. 
+			if [ $debug == true ]; then
+				btime=$(sudo stat -c %W "$file")
+				if [ $btime = "0" ]; then
+					btime=$(birth_time "$file")
+				fi
+				atime=$(sudo stat -c %X "$file")
+				mtime=$(sudo stat -c %Y "$file")
+				ctime=$(sudo stat -c %Z "$file")
+				 
+				Btime=$(date -d @$btime "$date_format")
+				Atime=$(date -d @$atime "$date_format")
+				Mtime=$(date -d @$mtime "$date_format")
+				Ctime=$(date -d @$ctime "$date_format")
+				
+				dBtime=$(format_time_delta $btime)
+				dAtime=$(format_time_delta $atime)
+				dMtime=$(format_time_delta $mtime)
+				dCtime=$(format_time_delta $ctime)
+				
+				dABtime=$(format_time_delta $atime $btime)
+				dMBtime=$(format_time_delta $mtime $btime)
+				dCBtime=$(format_time_delta $ctime $btime)
+				
+				echo "$bname"
+				echo -e "\tbirth: $btime $Btime $dBtime"
+				echo -e "\taccess:$atime $Atime $dAtime\t\t$dABtime since birth" 
+				echo -e "\tmod:   $mtime $Mtime $dMtime\t\t$dMBtime since birth"
+				echo -e "\tchange:$ctime $Ctime $dCtime\t\t$dCBtime since birth"
+			fi
+		
+			mtime=$(sudo stat -c %Y "$file")
 
+			# Log the filename and modification time
+			echo "$bname $mtime" >> "$wal_time_log"
+	    done
+	fi
 }
 
 purge_wals() {
@@ -196,7 +370,123 @@ purge_wals() {
     if [ $verbose = true ]; then
       echo "Purging WALs prior to $redo_wal"
     fi
-    ${prefix}$pg_bin_dir/pg_archivecleanup "$local_archive_mount/$wals_subdir" "$redo_wal"
+    ${prefix}"$pg_bin_dir/pg_archivecleanup" "$local_archive_mount/$wals_subdir" "$redo_wal"
+    
+    # Purge and remove WAL files form the wal birth time log too
+	> "${wal_time_log}~"  # Clear a working intermediate file first
+    sudo find "$local_archive_mount/$wals_subdir" -maxdepth 1 -type f | while read -r file; do
+    	bname=$(basename "$file")
+	    if grep -q "^$bname " "$wal_time_log"; then
+	    	line=$(grep "^$bname " "$wal_time_log")
+	        echo $line >> "${wal_time_log}~"
+	    else
+	        echo "WAL File '$bname' was purged."
+	    fi	    	    	
+    done
+    mv "${wal_time_log}~" "$wal_time_log"
+}
+
+# Alas there's no way to get file birth times from stat or ls, and we need to use debugfs
+# Which requires sudoand a little preparation and manipulation so a function.
+# Note from Ubuntu 22.04 stat and ls can report birth time. 
+# Alas we're running on Ubuntu 20.04 at time. This can go away in time.
+birth_time() {
+    local file=$1
+    local formatted=$2
+
+    # Find the device the file is on
+    dev=$(sudo df $file | sed -n '2{s/ .*$//;p}')
+
+    # Get the files inode number
+    inode=$(sudo stat -c %i $file)
+
+    #  Run the debugfs stat command and nab the crtime line
+    line=$(sudo debugfs -R "stat <$inode>" $dev 2> /dev/null | grep 'crtime:')
+
+    # Make an array of the line (split on white space)
+    parts=($line)
+
+    # Nab the second element as the hex fields
+    hex=(${parts[1]//[:x]/ })
+
+    # Split into the two hex components (and uppercase it)
+    hextime=${hex[1]^^}
+    hexnano=${hex[2]^^}
+
+    # Two lowest order bits of nano are the two uppermose bits of the time (ext4 weirdness ;-)
+    # It means we have to pluck the lowest order two bits from hexnano and make them the two
+    # highest order bits of hex time. These will only be non zero after the year 2038 (which
+    # 32 bit seconds since epoch can't represent and filestamps will hit their limit). These
+    # two extra bits that ext4 offers suppot up until the 2106, delaying the crunch almost
+    # a century, and well past any current filesystem's expected survival ;-) whereas they
+    # may well survive 2038.
+    highbits=$((16#$hexnano&3))       # Mask all but lowest two bits
+    let "highbits <<= 32"             # Shift them left 32 places so they becomes bits 33 and 34
+    lowbits=$((16#$hextime))          # Nab the32 low bits
+    fixtime=$((highbits + lowbits))   # Add them to make a 34 bit number (of seconds since epoch)
+
+    fixnano=$((16#$hexnano>>2))       # Shift nanoseconds left two bits (the two bits we stole above)
+    fixnano=$(printf "%09d" $fixnano) # Left pad with zeros for us in the formatted output
+
+    # Format the birth time consistent with stat
+    btime=$(date -d "@$fixtime" "$date_format")
+
+    # Return the birth time
+    if [ "$formatted" = "true" ]; then
+        echo $btime
+    else
+        echo $fixtime
+    fi
+}
+
+format_time_delta() {
+    local ref_time=$1
+    local new_time=$2
+    if [ -z "$new_time" ]; then
+        new_time=$(date '+%s')
+    fi
+    local delta=$(( new_time - ref_time ))
+    local suffix=""
+
+    if (( delta < 0 )); then
+        delta=$(( -delta ))
+    elif (( delta > 0 )); then
+        suffix=" ago"
+    fi
+
+    local years=$(( delta / 31536000 ))
+    local remainder=$(( delta % 31536000 ))
+    local months=$(( remainder / 2592000 ))
+    remainder=$(( remainder % 2592000 ))
+    local weeks=$(( remainder / 604800 ))
+    remainder=$(( remainder % 604800 ))
+    local days=$(( remainder / 86400 ))
+    remainder=$(( remainder % 86400 ))
+    local hours=$(( remainder / 3600 ))
+    remainder=$(( remainder % 3600 ))
+    local minutes=$(( remainder / 60 ))
+    local seconds=$(( remainder % 60 ))
+
+    local result=()
+    (( years > 0 )) && result+=("${years} year$([ $years -ne 1 ] && echo "s")")
+    (( months > 0 )) && result+=("${months} month$([ $months -ne 1 ] && echo "s")")
+    (( weeks > 0 )) && result+=("${weeks} week$([ $weeks -ne 1 ] && echo "s")")
+    (( days > 0 )) && result+=("${days} day$([ $days -ne 1 ] && echo "s")")
+    (( hours > 0 )) && result+=("${hours} hour$([ $hours -ne 1 ] && echo "s")")
+    (( minutes > 0 )) && result+=("${minutes} minute$([ $minutes -ne 1 ] && echo "s")")
+    (( seconds > 0 )) && result+=("${seconds} second$([ $seconds -ne 1 ] && echo "s")")
+
+    local result_str=""
+    local len=${#result[@]}
+
+    if (( len > 1 )); then
+        result_str=$(printf ", %s" "${result[@]:0:$((len-1))}")
+        result_str="${result_str:2} and ${result[-1]}"
+    else
+        result_str=${result[*]}
+    fi
+
+    echo "${result_str}${suffix}"
 }
 
 # Check prerequistes first
@@ -206,32 +496,117 @@ check_prerequisites
 # for working with a remote backup location. The easiest way to esnure it all works well
 # is with an sshfs.
 mkdir -p "$local_archive_mount"
+ssh $target_user@$target_host "mkdir -p \"$target_dir\""
 if [ $verbose = true ]; then
   echo Mounting "$target_user@$target_host:$target_dir" on "$local_archive_mount"
 fi
-sshfs "$target_user@$target_host:$target_dir" "$local_archive_mount"
+sshfs -o allow_root "$target_user@$target_host:$target_dir" "$local_archive_mount"
 
-if ! [ -d "$local_archive_mount/$base_subdir" ]; then
-    echo "No existing base backup."
-    backup_base
-else
-    last_base_time=$($pg_bin_dir/pg_controldata "$local_archive_mount/$base_subdir" | awk -F: '/Time of latest checkpoint:/ {print $2}' | xargs)
-    last_base_time_s=$(date -d "$last_base_time" '+%s')
-    current_time_s=$(date '+%s')
-    base_age_days=$(( (current_time_s - last_base_time_s) / (60 * 60 * 24) ))
-
-    if [ $verbose = true ]; then
-        echo "  Last base backed up: $last_base_time"
-        echo "  Last base age (days): $base_age_days"
+if [ $list = true ]; then
+	# Just print a list of current backup status
+	if [ -d "$local_archive_mount/$base_subdir" ]; then
+    	last_base_time=$($pg_bin_dir/pg_controldata "$local_archive_mount/$base_subdir" | grep 'Time of latest checkpoint:' | cut -d: -f2- | xargs)
+    	ilast_base_time=$(date -d "$last_base_time" +%s)
+    	dlast_base_time=$(format_time_delta $ilast_base_time)
+    	inext_base_time=$(($ilast_base_time + $rebase_days * 60 * 60 * 24))
+    	next_base_time=$(date -d @"$inext_base_time" "$date_format" | sed 's/  / /')
+    	dnext_base_time=$(format_time_delta $inext_base_time)
+    	base_size="\t($(du -sh "$local_archive_mount/$base_subdir" | cut -f1))"
+	else
+		last_base_time="None"
+		dlast_base_time=""
+		base_size=""		
     fi
+   
+	if [ -f "$wal_time_log" ]; then
+   		ilast_wal_backed_up=$(cut -d ' ' -f 2 "$wal_time_log" | sort -n | tail -n 1)
+   		last_wal_backed_up=$(date -d @"$ilast_wal_backed_up" "$date_format" | sed 's/  / /')
+    	dlast_wal_backed_up=$(format_time_delta $ilast_wal_backed_up)   	
+    	wal_size="\t($(du -sh "$local_archive_mount/$wals_subdir" | cut -f1))"
+   	else
+   		last_wal_backed_up="None"
+    	dlast_wal_backed_up=""
+    	wal_size=""
+   	fi
+    
+	if [ -f "$run_time_log" ]; then
+   		last_backup_run=$(tail -1 "$run_time_log")
+    	ilast_backup_run=$(date -d "$last_backup_run" +%s)
+    	dlast_backup_run=$(format_time_delta $ilast_backup_run)   	
+   	else
+   		last_backup_run="None"
+   		dlast_backup_run=""
+   	fi
 
-    if [ "$base_age_days" -gt "$rebase_days" ]; then
-        backup_base
-    fi
+	current_time=$(date "$date_format" | sed 's/  / /')
+	
+    echo -e "Current time:                $current_time"
+    echo -e "Last successful backup run:  $last_backup_run\t$dlast_backup_run"
+    echo -e "Last full database backup:   $last_base_time\t$dlast_base_time$base_size"
+    echo -e "Next full database backup:   Next run after $dnext_base_time ($next_base_time)"
+    echo -e "Last WAL backed up:          $last_wal_backed_up\t$dlast_wal_backed_up$wal_size"
+    
+    if [ -f "$sql_target" ]; then
+    	size=$(du -sh "$sql_target" | cut -f1)
+		mtime=$(sudo stat -c %Y "$sql_target")
+		Mtime=$(date -d @$mtime "$date_format" | sed 's/  / /')
+		dmtime=$(format_time_delta $mtime)
+	    echo -e "Last full database SQL dump: $Mtime\t$dmtime\t($size)"
+    fi    
+elif [ $mount = true ]; then
+    echo "Archive is mounted at $local_archive_mount"
+    exit 0 # Don't unmount
+else 
+	# Else, Perform a full database backup if 
+	#     there isn't one, or 
+	#     one was requested or 
+	#     rebase_days have passed since the last one
+	if ! [ -d "$local_archive_mount/$base_subdir" ]; then
+	    echo "No existing base backup."
+	    backup_base
+	    if [ $dump_sql = true ] || [ $dump_SQL = true ]; then
+	    	dump_sql
+	    fi
+	elif [ $base = true ]; then
+	    echo "Base backup requested."
+	    backup_base
+	    if [ $dump_sql = true ] || [ $dump_SQL = true ]; then
+	    	dump_sql
+	    fi
+	else
+    	last_base_time=$($pg_bin_dir/pg_controldata "$local_archive_mount/$base_subdir" | grep 'Time of latest checkpoint:' | cut -d: -f2- | xargs)
+	    last_base_time_s=$(date -d "$last_base_time" '+%s')
+	    current_time_s=$(date '+%s')
+	    base_age_days=$(( (current_time_s - last_base_time_s) / (60 * 60 * 24) ))
+	
+	    if [ $verbose = true ]; then
+	        echo -e "\tLast base backed up: $last_base_time"
+	        echo -e "\tLast base age (days): $base_age_days"
+	        echo -e "\tAge limit (days): $rebase_days"
+	    fi
+	
+	    if [ "$base_age_days" -gt "$rebase_days" ]; then
+	        backup_base
+		    if [ $dump_sql = true ] || [ $dump_SQL = true ]; then
+		    	dump_sql
+		    fi
+		elif [ $dump_SQL = true ]; then
+	    	dump_sql
+	    fi
+	fi
+	
+	backup_wals
+	purge_wals
+	
+	if [ -f "$run_time_log" ]; then
+		logged_runs=$(wc -l < "$run_time_log")
+		if [ $logged_runs -gt $run_time_log_days ]; then
+			> "$run_time_log"
+		fi
+	fi
+	current_time=$(date "$date_format" | sed 's/  / /')
+	echo "$current_time" >> "$run_time_log"
 fi
-
-backup_wals
-purge_wals
 
 if [ $verbose = true ]; then
   echo Releasing mount on "$local_archive_mount"

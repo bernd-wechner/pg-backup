@@ -1,0 +1,37 @@
+#!/bin/bash
+# Quick script to install the nightly service.
+#
+# systemctl enable only accepts absolute paths.
+# This script designed to run in the same folder
+# as the .service and .timer file.
+#
+# --now actually strats the timer.
+#
+# To check on it:
+#
+#   systemctl list-timers --all
+#
+# Of if that list is too long:
+#
+#   systemctl list-timers pg-backup.timer
+#
+# And of course:
+#
+#   systemctl status pg-backup.service
+#   systemctl status pg-backup.timer
+#
+# Will show the status of the timer and the
+# service it runs.
+#
+# The .timer file needs to be configured with the
+# run schedule (default)
+#
+# The .service file needs to point to the pg-backup
+# script.
+#
+# systemctl enable creates symlinks from system
+# folders to the originals. So they need a
+# permanent home, can't be deleted.
+
+sudo systemctl enable --now `realpath pg-backup.service`
+sudo systemctl enable --now `realpath pg-backup.timer`

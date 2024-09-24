@@ -1,0 +1,31 @@
+#!/bin/bash
+
+# The service file contains an absolute path to the pg-backup binary and this needs patching for the current system
+# The timer file does not and it can be used as is
+script_dir="$(dirname $0)"
+host_name="$(hostname)"
+place_holder="pg-backup-path"
+if [ -f "$script_dir/pg-backup" ]; then
+    bin_path=$(realpath "$script_dir/pg-backup")
+    if [ -f "$script_dir/pg-backup.service" ]; then
+        sed "s|$place_holder|$bin_path|g" "$script_dir/pg-backup.service" > "$script_dir/pg-backup.service.$host_name"
+    else
+        echo "ERROR: Cannot find pg-backup.service"
+        exit 1
+    fi
+else
+    echo "ERROR: Cannot find pg-backup"
+    exit 1
+fi
+
+cd "$script_dir"
+
+sudo systemctl stop pg-backup.service
+sudo systemctl stop pg-backup.timer
+sudo cp pg-backup.service.$host_name /etc/systemd/system/pg-backup.service
+sudo cp pg-backup.timer /etc/systemd/system
+sudo systemctl daemon-reload
+sudo systemctl start pg-backup.service
+sudo systemctl start pg-backup.timer
+systemctl status pg-backup.service
+systemctl status pg-backup.timer
